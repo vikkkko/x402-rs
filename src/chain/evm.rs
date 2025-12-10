@@ -30,7 +30,7 @@ use alloy::providers::{
     Identity, MULTICALL3_ADDRESS, MulticallItem, Provider, RootProvider, WalletProvider,
 };
 use alloy::rpc::client::RpcClient;
-use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+use alloy::rpc::types::{TransactionInput, TransactionInputKind, TransactionReceipt, TransactionRequest};
 use alloy::sol_types::{Eip712Domain, SolCall, SolStruct, eip712_domain};
 use alloy::{hex, sol};
 use async_trait::async_trait;
@@ -82,6 +82,22 @@ type InnerFiller = JoinFill<
     JoinFill<BlobGasFiller, JoinFill<NonceFiller<PendingNonceManager>, ChainIdFiller>>,
 >;
 
+/// Force calldata to be present in both `data` and `input` fields for clients (e.g. Besu) that
+/// reject `input`. Applied to `eth_call` builders.
+fn normalize_call_data<P, D>(
+    call: alloy::contract::SolCallBuilder<P, D>,
+) -> alloy::contract::SolCallBuilder<P, D>
+where
+    P: alloy::providers::Provider,
+    D: alloy::sol_types::SolCall,
+{
+    call.map(|mut tx| {
+        tx.set_input_and_data();
+        tx.normalize_data();
+        tx
+    })
+}
+
 /// The fully composed Ethereum provider type used in this project.
 ///
 /// Combines multiple filler layers for gas, nonce, chain ID, blob gas, and wallet signing,
@@ -128,7 +144,7 @@ impl TryFrom<Network> for EvmChain {
             Network::XdcMainnet => Ok(EvmChain::new(value, 50)),
             Network::AvalancheFuji => Ok(EvmChain::new(value, 43113)),
             Network::Avalanche => Ok(EvmChain::new(value, 43114)),
-            Network::XrplEvm => Ok(EvmChain::new(value, 1440000)),
+            Network::XrplEvm => Ok(EvmChain::new(value, 1_440_000)),
             Network::Solana => Err(FacilitatorLocalError::UnsupportedNetwork(None)),
             Network::SolanaDevnet => Err(FacilitatorLocalError::UnsupportedNetwork(None)),
             Network::PolygonAmoy => Ok(EvmChain::new(value, 80002)),
@@ -210,10 +226,7 @@ impl EvmProvider {
             GasFiller,
             JoinFill::new(
                 BlobGasFiller,
-                JoinFill::new(
-                    NonceFiller::new(nonce_manager.clone()),
-                    ChainIdFiller::default(),
-                ),
+                JoinFill::new(NonceFiller::new(nonce_manager.clone()), ChainIdFiller::default()),
             ),
         );
 
@@ -331,9 +344,11 @@ impl MetaEvmProvider for EvmProvider {
     ) -> Result<TransactionReceipt, Self::Error> {
         let from_address = self.next_signer_address();
         let mut txr = TransactionRequest::default()
-            .with_to(tx.to)
-            .with_from(from_address)
-            .with_input(tx.calldata);
+            .to(tx.to)
+            .from(from_address)
+            .input(TransactionInput::maybe_input(Some(tx.calldata)));
+        // Besu expects calldata in the `data` field; normalize to `data` and drop `input`.
+        txr.normalize_data();
         if !self.eip1559 {
             let provider = &self.inner;
             let gas: u128 = provider
@@ -360,7 +375,7 @@ impl MetaEvmProvider for EvmProvider {
             std::env::var("TX_RECEIPT_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
+                .unwrap_or(30)
         );
 
         let watcher = pending_tx
@@ -407,7 +422,7 @@ impl FromEnvByNetworkBuild for EvmProvider {
             Network::XdcMainnet => false,
             Network::AvalancheFuji => true,
             Network::Avalanche => true,
-            Network::XrplEvm => false,
+            Network::XrplEvm => true,
             Network::Solana => false,
             Network::SolanaDevnet => false,
             Network::PolygonAmoy => true,
@@ -462,11 +477,13 @@ where
                 // Prepare the call to simulate transfer the funds
                 let transfer_call = transferWithAuthorization_0(&contract, &payment, inner).await?;
                 // Execute both calls in a single transaction simulation to accommodate for possible smart wallet creation
-                let (is_valid_signature_result, transfer_result) = self
-                    .inner()
+                let provider = self.inner();
+                let multicall = provider
                     .multicall()
+                    .with_input_kind(TransactionInputKind::Both)
                     .add(is_valid_signature_call)
-                    .add(transfer_call.tx)
+                    .add(transfer_call.tx);
+                let (is_valid_signature_result, transfer_result) = multicall
                     .aggregate3()
                     .instrument(tracing::info_span!("call_transferWithAuthorization_0",
                             from = %transfer_call.from,
@@ -495,8 +512,7 @@ where
                 // It is EOA or EIP-1271 signature, which we can pass to the transfer simulation
                 let transfer_call =
                     transferWithAuthorization_0(&contract, &payment, signature).await?;
-                transfer_call
-                    .tx
+                normalize_call_data(transfer_call.tx)
                     .call()
                     .into_future()
                     .instrument(tracing::info_span!("call_transferWithAuthorization_0",
@@ -754,6 +770,11 @@ async fn assert_enough_balance<P: Provider>(
 ) -> Result<(), FacilitatorLocalError> {
     let balance = usdc_contract
         .balanceOf(sender.0)
+        .map(|mut tx| {
+            tx.set_input_and_data();
+            tx.normalize_data();
+            tx
+        })
         .call()
         .into_future()
         .instrument(tracing::info_span!(
@@ -839,21 +860,8 @@ async fn assert_domain<P: Provider>(
         .extra
         .as_ref()
         .and_then(|e| e.get("name")?.as_str().map(str::to_string))
-        .or_else(|| usdc.eip712.clone().map(|e| e.name));
-    let name = if let Some(name) = name {
-        name
-    } else {
-        token_contract
-            .name()
-            .call()
-            .into_future()
-            .instrument(tracing::info_span!(
-                "fetch_eip712_name",
-                otel.kind = "client",
-            ))
-            .await
-            .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?
-    };
+        .or_else(|| usdc.eip712.clone().map(|e| e.name))
+        .ok_or(FacilitatorLocalError::UnsupportedNetwork(None))?;
     let chain_id = chain.chain_id;
     let version = requirements
         .extra
@@ -870,8 +878,7 @@ async fn assert_domain<P: Provider>(
     let version = if let Some(version) = version {
         version
     } else {
-        token_contract
-            .version()
+        normalize_call_data(token_contract.version())
             .call()
             .into_future()
             .instrument(tracing::info_span!(
