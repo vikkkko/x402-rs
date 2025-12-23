@@ -13,6 +13,7 @@ use x402_rs::timestamp::UnixTimestamp;
 use x402_rs::types::{
     EvmSignature, ExactEvmPayload, ExactEvmPayloadAuthorization, ExactPaymentPayload,
     HexEncodedNonce, PaymentPayload, PaymentRequirements, Scheme, TransferWithAuthorization,
+    TransferWithAuthorizationMemo,
 };
 
 #[derive(Clone)]
@@ -64,8 +65,8 @@ impl SenderWallet for EvmSenderWallet {
         &self,
         selected: PaymentRequirements,
     ) -> Result<PaymentPayload, X402PaymentsError> {
-        let (name, version) = match selected.extra {
-            None => (None, None),
+        let (name, version, memo) = match selected.extra {
+            None => (None, None, None),
             Some(extra) => {
                 let name = extra
                     .get("name")
@@ -75,7 +76,11 @@ impl SenderWallet for EvmSenderWallet {
                     .get("version")
                     .and_then(|v| v.as_str())
                     .map(ToOwned::to_owned);
-                (name, version)
+                let memo = extra
+                    .get("memo")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned);
+                (name, version, memo)
             }
         };
         let network = selected.network;
@@ -103,18 +108,35 @@ impl SenderWallet for EvmSenderWallet {
             valid_after,
             valid_before,
             nonce: HexEncodedNonce(nonce),
+            memo: memo.clone(),
         };
         #[cfg(feature = "telemetry")]
         tracing::debug!(?authorization, "Constructed authorization payload");
-        let transfer_with_authorization = TransferWithAuthorization {
-            from: authorization.from.into(),
-            to: authorization.to.into(),
-            value: authorization.value.into(),
-            validAfter: authorization.valid_after.into(),
-            validBefore: authorization.valid_before.into(),
-            nonce: FixedBytes(nonce),
+        let eip712_hash = match memo {
+            Some(memo) => {
+                let transfer_with_authorization = TransferWithAuthorizationMemo {
+                    from: authorization.from.into(),
+                    to: authorization.to.into(),
+                    value: authorization.value.into(),
+                    validAfter: authorization.valid_after.into(),
+                    validBefore: authorization.valid_before.into(),
+                    nonce: FixedBytes(nonce),
+                    memo,
+                };
+                transfer_with_authorization.eip712_signing_hash(&domain)
+            }
+            None => {
+                let transfer_with_authorization = TransferWithAuthorization {
+                    from: authorization.from.into(),
+                    to: authorization.to.into(),
+                    value: authorization.value.into(),
+                    validAfter: authorization.valid_after.into(),
+                    validBefore: authorization.valid_before.into(),
+                    nonce: FixedBytes(nonce),
+                };
+                transfer_with_authorization.eip712_signing_hash(&domain)
+            }
         };
-        let eip712_hash = transfer_with_authorization.eip712_signing_hash(&domain);
         let signature = self
             .signer
             .sign_hash(&eip712_hash)

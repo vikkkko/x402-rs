@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  x402:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY-}
+        HTTPS_PROXY: ${HTTPS_PROXY-}
+        CARGO_HTTP_MULTIPLEXING: ${CARGO_HTTP_MULTIPLEXING-}
+        CARGO_HTTP_TIMEOUT: ${CARGO_HTTP_TIMEOUT-}
+        CARGO_NET_RETRY: ${CARGO_NET_RETRY-}
+    image: x402:latest
+    env_file: .env
+    environment:
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-8090}
+    ports:
+      - "${PORT:-8090}:${PORT:-8090}"
+    restart: unless-stopped

@@ -255,7 +255,7 @@ impl Serialize for HexEncodedNonce {
 
 /// EIP-712 structured data for ERC-3009-based authorization.
 /// Defines who can transfer how much USDC and when.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExactEvmPayloadAuthorization {
     pub from: EvmAddress,
@@ -264,6 +264,9 @@ pub struct ExactEvmPayloadAuthorization {
     pub valid_after: UnixTimestamp,
     pub valid_before: UnixTimestamp,
     pub nonce: HexEncodedNonce,
+    /// Optional memo for custom ERC-3009 variants.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub memo: Option<String>,
 }
 
 /// Full payload required to authorize an ERC-3009 transfer:
@@ -1435,5 +1438,23 @@ sol!(
         uint256 validAfter;
         uint256 validBefore;
         bytes32 nonce;
+    }
+);
+
+sol!(
+    /// Solidity-compatible struct definition for ERC-3009 `transferWithAuthorization`
+    /// with an additional `memo` field.
+    ///
+    /// This mirrors a custom variant of the function that includes `memo`
+    /// in the typed data.
+    #[derive(Serialize, Deserialize)]
+    struct TransferWithAuthorizationMemo {
+        address from;
+        address to;
+        uint256 value;
+        uint256 validAfter;
+        uint256 validBefore;
+        bytes32 nonce;
+        string memo;
     }
 );

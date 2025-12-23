@@ -50,7 +50,8 @@ use crate::types::{
     EvmAddress, EvmSignature, ExactPaymentPayload, FacilitatorErrorReason, HexEncodedNonce,
     MixedAddress, PaymentPayload, PaymentRequirements, Scheme, SettleRequest, SettleResponse,
     SupportedPaymentKind, SupportedPaymentKindsResponse, TokenAmount, TransactionHash,
-    TransferWithAuthorization, VerifyRequest, VerifyResponse, X402Version,
+    TransferWithAuthorization, TransferWithAuthorizationMemo, VerifyRequest, VerifyResponse,
+    X402Version,
 };
 
 sol!(
@@ -172,6 +173,8 @@ pub struct ExactEvmPayment {
     pub valid_before: UnixTimestamp,
     /// Unique 32-byte nonce (prevents replay).
     pub nonce: HexEncodedNonce,
+    /// Optional memo included in custom transferWithAuthorization typed data.
+    pub memo: Option<String>,
     /// Raw signature bytes (EIP-1271 or EIP-6492-wrapped).
     pub signature: EvmSignature,
 }
@@ -472,32 +475,56 @@ where
             } => {
                 // Prepare the call to validate EIP-6492 signature
                 let validator6492 = Validator6492::new(VALIDATOR_ADDRESS, self.inner());
-                let is_valid_signature_call =
-                    validator6492.isValidSigWithSideEffects(payer, hash, original);
                 // Prepare the call to simulate transfer the funds
                 let transfer_call = transferWithAuthorization_0(&contract, &payment, inner).await?;
+                let TransferWithAuthorizationCall {
+                    tx,
+                    from,
+                    to,
+                    value,
+                    valid_after,
+                    valid_before,
+                    nonce,
+                    memo,
+                    signature,
+                    contract_address,
+                } = transfer_call;
                 // Execute both calls in a single transaction simulation to accommodate for possible smart wallet creation
                 let provider = self.inner();
-                let multicall = provider
-                    .multicall()
-                    .with_input_kind(TransactionInputKind::Both)
-                    .add(is_valid_signature_call)
-                    .add(transfer_call.tx);
-                let (is_valid_signature_result, transfer_result) = multicall
-                    .aggregate3()
-                    .instrument(tracing::info_span!("call_transferWithAuthorization_0",
-                            from = %transfer_call.from,
-                            to = %transfer_call.to,
-                            value = %transfer_call.value,
-                            valid_after = %transfer_call.valid_after,
-                            valid_before = %transfer_call.valid_before,
-                            nonce = %transfer_call.nonce,
-                            signature = %transfer_call.signature,
-                            token_contract = %transfer_call.contract_address,
-                            otel.kind = "client",
-                    ))
-                    .await
-                    .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
+                let span = tracing::info_span!("call_transferWithAuthorization_0",
+                        from = %from,
+                        to = %to,
+                        value = %value,
+                        valid_after = %valid_after,
+                        valid_before = %valid_before,
+                        nonce = %nonce,
+                        signature = %signature,
+                        memo = %memo.as_deref().unwrap_or(""),
+                        token_contract = %contract_address,
+                        otel.kind = "client",
+                );
+                let (is_valid_signature_result, transfer_result) = match tx {
+                    TransferCallBuilder::BytesSig(tx) => provider
+                        .multicall()
+                        .with_input_kind(TransactionInputKind::Both)
+                        .add(validator6492.isValidSigWithSideEffects(payer, hash, original.clone()))
+                        .add(tx)
+                        .aggregate3()
+                        .instrument(span.clone())
+                        .await
+                        .map(|(sig, transfer)| (sig, transfer.map(|_| ())))
+                        .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?,
+                    TransferCallBuilder::MemoVrs(tx) => provider
+                        .multicall()
+                        .with_input_kind(TransactionInputKind::Both)
+                        .add(validator6492.isValidSigWithSideEffects(payer, hash, original.clone()))
+                        .add(tx)
+                        .aggregate3()
+                        .instrument(span)
+                        .await
+                        .map(|(sig, transfer)| (sig, transfer.map(|_| ())))
+                        .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?,
+                };
                 let is_valid_signature_result = is_valid_signature_result
                     .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
                 if !is_valid_signature_result {
@@ -512,9 +539,9 @@ where
                 // It is EOA or EIP-1271 signature, which we can pass to the transfer simulation
                 let transfer_call =
                     transferWithAuthorization_0(&contract, &payment, signature).await?;
-                normalize_call_data(transfer_call.tx)
-                    .call()
-                    .into_future()
+                transfer_call
+                    .tx
+                    .simulate()
                     .instrument(tracing::info_span!("call_transferWithAuthorization_0",
                             from = %transfer_call.from,
                             to = %transfer_call.to,
@@ -523,6 +550,7 @@ where
                             valid_before = %transfer_call.valid_before,
                             nonce = %transfer_call.nonce,
                             signature = %transfer_call.signature,
+                            memo = %transfer_call.memo.as_deref().unwrap_or(""),
                             token_contract = %transfer_call.contract_address,
                             otel.kind = "client",
                     ))
@@ -569,11 +597,12 @@ where
             } => {
                 let is_contract_deployed = is_contract_deployed(self.inner(), &payer).await?;
                 let transfer_call = transferWithAuthorization_0(&contract, &payment, inner).await?;
+                let (transfer_target, transfer_calldata) = transfer_call.tx.target_and_calldata();
                 if is_contract_deployed {
                     // transferWithAuthorization with inner signature
                     self.send_transaction(MetaTransaction {
-                        to: transfer_call.tx.target(),
-                        calldata: transfer_call.tx.calldata().clone(),
+                        to: transfer_target,
+                        calldata: transfer_calldata.clone(),
                         confirmations: 1,
                     })
                     .instrument(
@@ -585,6 +614,7 @@ where
                             valid_before = %transfer_call.valid_before,
                             nonce = %transfer_call.nonce,
                             signature = %transfer_call.signature,
+                            memo = %transfer_call.memo.as_deref().unwrap_or(""),
                             token_contract = %transfer_call.contract_address,
                             sig_kind="EIP6492.deployed",
                             otel.kind = "client",
@@ -599,8 +629,8 @@ where
                     };
                     let transfer_with_authorization_call = IMulticall3::Call3 {
                         allowFailure: false,
-                        target: transfer_call.tx.target(),
-                        callData: transfer_call.tx.calldata().clone(),
+                        target: transfer_target,
+                        callData: transfer_calldata.clone(),
                     };
                     let aggregate_call = IMulticall3::aggregate3Call {
                         calls: vec![deployment_call, transfer_with_authorization_call],
@@ -619,6 +649,7 @@ where
                             valid_before = %transfer_call.valid_before,
                             nonce = %transfer_call.nonce,
                             signature = %transfer_call.signature,
+                            memo = %transfer_call.memo.as_deref().unwrap_or(""),
                             token_contract = %transfer_call.contract_address,
                             sig_kind="EIP6492.counterfactual",
                             otel.kind = "client",
@@ -629,10 +660,11 @@ where
             StructuredSignature::EIP1271(eip1271_signature) => {
                 let transfer_call =
                     transferWithAuthorization_0(&contract, &payment, eip1271_signature).await?;
+                let (target, calldata) = transfer_call.tx.target_and_calldata();
                 // transferWithAuthorization with eip1271 signature
                 self.send_transaction(MetaTransaction {
-                    to: transfer_call.tx.target(),
-                    calldata: transfer_call.tx.calldata().clone(),
+                    to: target,
+                    calldata,
                     confirmations: 1,
                 })
                 .instrument(
@@ -644,6 +676,7 @@ where
                         valid_before = %transfer_call.valid_before,
                         nonce = %transfer_call.nonce,
                         signature = %transfer_call.signature,
+                        memo = %transfer_call.memo.as_deref().unwrap_or(""),
                         token_contract = %transfer_call.contract_address,
                         sig_kind="EIP1271",
                         otel.kind = "client",
@@ -695,15 +728,21 @@ where
     }
 }
 
+/// Variants of the transfer call we can issue (legacy bytes sig or custom memo + v/r/s).
+pub enum TransferCallBuilder<P> {
+    BytesSig(SolCallBuilder<P, USDC::transferWithAuthorization_0Call>),
+    MemoVrs(SolCallBuilder<P, USDC::transferWithAuthorization_2Call>),
+}
+
 /// A prepared call to `transferWithAuthorization` (ERC-3009) including all derived fields.
 ///
 /// This struct wraps the assembled call builder, making it reusable across verification
 /// (`.call()`) and settlement (`.send()`) flows, along with context useful for tracing/logging.
 ///
 /// This is created by [`EvmProvider::transferWithAuthorization_0`].
-pub struct TransferWithAuthorization0Call<P> {
+pub struct TransferWithAuthorizationCall<P> {
     /// The prepared call builder that can be `.call()`ed or `.send()`ed.
-    pub tx: SolCallBuilder<P, USDC::transferWithAuthorization_0Call>,
+    pub tx: TransferCallBuilder<P>,
     /// The sender (`from`) address for the authorization.
     pub from: alloy::primitives::Address,
     /// The recipient (`to`) address for the authorization.
@@ -716,10 +755,38 @@ pub struct TransferWithAuthorization0Call<P> {
     pub valid_before: U256,
     /// 32-byte authorization nonce (prevents replay).
     pub nonce: FixedBytes<32>,
+    /// Optional memo included in the custom variant.
+    pub memo: Option<String>,
     /// EIP-712 signature for the transfer authorization.
     pub signature: Bytes,
     /// Address of the token contract used for this transfer.
     pub contract_address: alloy::primitives::Address,
+}
+
+impl<P: Provider> TransferCallBuilder<P> {
+    fn target_and_calldata(&self) -> (alloy::primitives::Address, Bytes) {
+        match self {
+            TransferCallBuilder::BytesSig(tx) => ((*tx.target()).into(), tx.calldata().clone()),
+            TransferCallBuilder::MemoVrs(tx) => ((*tx.target()).into(), tx.calldata().clone()),
+        }
+    }
+
+    async fn simulate(self) -> Result<(), FacilitatorLocalError> {
+        match self {
+            TransferCallBuilder::BytesSig(tx) => normalize_call_data(tx)
+                .call()
+                .into_future()
+                .await
+                .map(|_| ())
+                .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}"))),
+            TransferCallBuilder::MemoVrs(tx) => normalize_call_data(tx)
+                .call()
+                .into_future()
+                .await
+                .map(|_| ())
+                .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}"))),
+        }
+    }
 }
 
 /// Validates that the current time is within the `validAfter` and `validBefore` bounds.
@@ -785,7 +852,6 @@ async fn assert_enough_balance<P: Provider>(
         ))
         .await
         .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
-
     if balance < max_amount_required {
         Err(FacilitatorLocalError::InsufficientFunds((*sender).into()))
     } else {
@@ -964,14 +1030,21 @@ async fn assert_valid_payment<P: Provider>(
     let domain = assert_domain(chain, &contract, payload, &asset_address, requirements).await?;
 
     let amount_required = requirements.max_amount_required.0;
-    assert_enough_balance(
-        &contract,
-        &payment_payload.authorization.from,
-        amount_required,
-    )
-    .await?;
-    let value: U256 = payment_payload.authorization.value.into();
-    assert_enough_value(&payer, &value, &amount_required)?;
+    let allow_negative_balance = requirements
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.get("allowNegativeBalance").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    if !allow_negative_balance {
+        assert_enough_balance(
+            &contract,
+            &payment_payload.authorization.from,
+            amount_required,
+        )
+        .await?;
+        let value: U256 = payment_payload.authorization.value.into();
+        assert_enough_value(&payer, &value, &amount_required)?;
+    }
 
     let payment = ExactEvmPayment {
         chain: *chain,
@@ -981,6 +1054,7 @@ async fn assert_valid_payment<P: Provider>(
         valid_after: payment_payload.authorization.valid_after,
         valid_before: payment_payload.authorization.valid_before,
         nonce: payment_payload.authorization.nonce,
+        memo: payment_payload.authorization.memo.clone(),
         signature: payment_payload.signature.clone(),
     };
 
@@ -991,7 +1065,7 @@ async fn assert_valid_payment<P: Provider>(
 ///
 /// This function prepares the transaction builder with gas pricing adapted to the network's
 /// capabilities (EIP-1559 or legacy) and packages it together with signature metadata
-/// into a [`TransferWithAuthorization0Call`] structure.
+/// into a [`TransferWithAuthorizationCall`] structure.
 ///
 /// This function does not perform any validation — it assumes inputs are already checked.
 #[allow(non_snake_case)]
@@ -999,23 +1073,40 @@ async fn transferWithAuthorization_0<'a, P: Provider>(
     contract: &'a USDC::USDCInstance<P>,
     payment: &ExactEvmPayment,
     signature: Bytes,
-) -> Result<TransferWithAuthorization0Call<&'a P>, FacilitatorLocalError> {
+) -> Result<TransferWithAuthorizationCall<&'a P>, FacilitatorLocalError> {
     let from: Address = payment.from.into();
     let to: Address = payment.to.into();
     let value: U256 = payment.value.into();
     let valid_after: U256 = payment.valid_after.into();
     let valid_before: U256 = payment.valid_before.into();
     let nonce = FixedBytes(payment.nonce.0);
-    let tx = contract.transferWithAuthorization_0(
-        from,
-        to,
-        value,
-        valid_after,
-        valid_before,
-        nonce,
-        signature.clone(),
-    );
-    Ok(TransferWithAuthorization0Call {
+    let memo = payment.memo.clone();
+    let tx = if let Some(memo) = memo.clone() {
+        let (v, r, s) = split_signature_to_vrs(&signature, &payment.from)?;
+        TransferCallBuilder::MemoVrs(contract.transferWithAuthorization_2(
+            from,
+            to,
+            value,
+            valid_after,
+            valid_before,
+            nonce,
+            memo,
+            v,
+            r,
+            s,
+        ))
+    } else {
+        TransferCallBuilder::BytesSig(contract.transferWithAuthorization_0(
+            from,
+            to,
+            value,
+            valid_after,
+            valid_before,
+            nonce,
+            signature.clone(),
+        ))
+    };
+    Ok(TransferWithAuthorizationCall {
         tx,
         from,
         to,
@@ -1023,9 +1114,29 @@ async fn transferWithAuthorization_0<'a, P: Provider>(
         valid_after,
         valid_before,
         nonce,
+        memo,
         signature,
         contract_address: *contract.address(),
     })
+}
+
+fn split_signature_to_vrs(
+    signature: &Bytes,
+    payer: &EvmAddress,
+) -> Result<(u8, FixedBytes<32>, FixedBytes<32>), FacilitatorLocalError> {
+    let bytes = signature.as_ref();
+    if bytes.len() < 65 {
+        return Err(FacilitatorLocalError::InvalidSignature(
+            (*payer).into(),
+            format!("Signature too short for v/r/s: {} bytes", bytes.len()),
+        ));
+    }
+    let mut r_bytes = [0u8; 32];
+    r_bytes.copy_from_slice(&bytes[0..32]);
+    let mut s_bytes = [0u8; 32];
+    s_bytes.copy_from_slice(&bytes[32..64]);
+    let v = bytes[64];
+    Ok((v, FixedBytes(r_bytes), FixedBytes(s_bytes)))
 }
 
 /// A structured representation of an Ethereum signature.
@@ -1092,15 +1203,31 @@ impl SignedMessage {
         payment: &ExactEvmPayment,
         domain: &Eip712Domain,
     ) -> Result<Self, FacilitatorLocalError> {
-        let transfer_with_authorization = TransferWithAuthorization {
-            from: payment.from.0,
-            to: payment.to.0,
-            value: payment.value.into(),
-            validAfter: payment.valid_after.into(),
-            validBefore: payment.valid_before.into(),
-            nonce: FixedBytes(payment.nonce.0),
+        let eip712_hash = match &payment.memo {
+            Some(memo) => {
+                let transfer_with_authorization = TransferWithAuthorizationMemo {
+                    from: payment.from.0,
+                    to: payment.to.0,
+                    value: payment.value.into(),
+                    validAfter: payment.valid_after.into(),
+                    validBefore: payment.valid_before.into(),
+                    nonce: FixedBytes(payment.nonce.0),
+                    memo: memo.clone(),
+                };
+                transfer_with_authorization.eip712_signing_hash(domain)
+            }
+            None => {
+                let transfer_with_authorization = TransferWithAuthorization {
+                    from: payment.from.0,
+                    to: payment.to.0,
+                    value: payment.value.into(),
+                    validAfter: payment.valid_after.into(),
+                    validBefore: payment.valid_before.into(),
+                    nonce: FixedBytes(payment.nonce.0),
+                };
+                transfer_with_authorization.eip712_signing_hash(domain)
+            }
         };
-        let eip712_hash = transfer_with_authorization.eip712_signing_hash(domain);
         let expected_address = payment.from;
         let structured_signature: StructuredSignature = payment.signature.clone().try_into()?;
         let signed_message = Self {
