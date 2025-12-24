@@ -146,12 +146,14 @@ impl TryFrom<Network> for EvmChain {
             Network::AvalancheFuji => Ok(EvmChain::new(value, 43113)),
             Network::Avalanche => Ok(EvmChain::new(value, 43114)),
             Network::XrplEvm => Ok(EvmChain::new(value, 1_440_000)),
-            Network::Solana => Err(FacilitatorLocalError::UnsupportedNetwork(None)),
-            Network::SolanaDevnet => Err(FacilitatorLocalError::UnsupportedNetwork(None)),
             Network::PolygonAmoy => Ok(EvmChain::new(value, 80002)),
             Network::Polygon => Ok(EvmChain::new(value, 137)),
             Network::Sei => Ok(EvmChain::new(value, 1329)),
             Network::SeiTestnet => Ok(EvmChain::new(value, 1328)),
+            Network::BesuPrivate => Ok(EvmChain::new(value, 1337)),
+            Network::Solana | Network::SolanaDevnet => {
+                Err(FacilitatorLocalError::UnsupportedNetwork(None))
+            }
         }
     }
 }
@@ -432,6 +434,7 @@ impl FromEnvByNetworkBuild for EvmProvider {
             Network::Polygon => true,
             Network::Sei => true,
             Network::SeiTestnet => true,
+            Network::BesuPrivate => false,
         };
         let provider = EvmProvider::try_new(wallet, &rpc_url, is_eip1559, network).await?;
         Ok(Some(provider))

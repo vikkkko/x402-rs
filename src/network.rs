@@ -7,6 +7,7 @@ use crate::types::{MixedAddress, TokenAsset, TokenDeployment, TokenDeploymentEip
 use alloy::primitives::address;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
 use solana_sdk::pubkey::Pubkey;
 use std::borrow::Borrow;
 use std::fmt::{Display, Formatter};
@@ -16,62 +17,65 @@ use std::str::FromStr;
 /// Supported Ethereum-compatible networks.
 ///
 /// Used to differentiate between testnet and mainnet environments for the x402 protocol.
-#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
     /// Base Sepolia testnet (chain ID 84532).
-    #[serde(rename = "base-sepolia")]
     BaseSepolia,
     /// Base mainnet (chain ID 8453).
-    #[serde(rename = "base")]
     Base,
     /// XDC mainnet (chain ID 50).
-    #[serde(rename = "xdc")]
     XdcMainnet,
     /// Avalanche Fuji testnet (chain ID 43113)
-    #[serde(rename = "avalanche-fuji")]
     AvalancheFuji,
     /// Avalanche Mainnet (chain ID 43114)
-    #[serde(rename = "avalanche")]
     Avalanche,
     /// XRPL EVM mainnet (chain ID 1440000)
-    #[serde(rename = "xrpl-evm")]
     XrplEvm,
     /// Solana Mainnet - Live production environment for deployed applications
-    #[serde(rename = "solana")]
     Solana,
     /// Solana Devnet - Testing with public accessibility for developers experimenting with their applications
-    #[serde(rename = "solana-devnet")]
     SolanaDevnet,
     /// Polygon Amoy testnet (chain ID 80002).
-    #[serde(rename = "polygon-amoy")]
     PolygonAmoy,
     /// Polygon mainnet (chain ID 137).
-    #[serde(rename = "polygon")]
     Polygon,
     /// Sei mainnet (chain ID 1329).
-    #[serde(rename = "sei")]
     Sei,
     /// Sei testnet (chain ID 1328).
-    #[serde(rename = "sei-testnet")]
     SeiTestnet,
+    /// Besu private network (chain ID 1337).
+    BesuPrivate,
 }
 
 impl Display for Network {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Network::BaseSepolia => write!(f, "base-sepolia"),
-            Network::Base => write!(f, "base"),
-            Network::XdcMainnet => write!(f, "xdc"),
-            Network::AvalancheFuji => write!(f, "avalanche-fuji"),
-            Network::Avalanche => write!(f, "avalanche"),
-            Network::XrplEvm => write!(f, "xrpl-evm"),
-            Network::Solana => write!(f, "solana"),
-            Network::SolanaDevnet => write!(f, "solana-devnet"),
-            Network::PolygonAmoy => write!(f, "polygon-amoy"),
-            Network::Polygon => write!(f, "polygon"),
-            Network::Sei => write!(f, "sei"),
-            Network::SeiTestnet => write!(f, "sei-testnet"),
-        }
+        write!(f, "{}", self.as_caip2().unwrap_or(self.as_legacy()))
+    }
+}
+
+impl Serialize for Network {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_caip2().unwrap_or(self.as_legacy()))
+    }
+}
+
+impl<'de> Deserialize<'de> for Network {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Network::from_str_any(&s).ok_or_else(|| {
+            D::Error::custom(format!(
+                "Unknown network '{}'. Supported legacy: {}; supported CAIP-2: {}",
+                s,
+                Network::legacy_variants().join(", "),
+                Network::caip2_variants().join(", ")
+            ))
+        })
     }
 }
 
@@ -96,6 +100,7 @@ impl From<Network> for NetworkFamily {
             Network::Polygon => NetworkFamily::Evm,
             Network::Sei => NetworkFamily::Evm,
             Network::SeiTestnet => NetworkFamily::Evm,
+            Network::BesuPrivate => NetworkFamily::Evm,
         }
     }
 }
@@ -116,7 +121,94 @@ impl Network {
             Network::Polygon,
             Network::Sei,
             Network::SeiTestnet,
+            Network::BesuPrivate,
         ]
+    }
+
+    fn as_legacy(&self) -> &'static str {
+        match self {
+            Network::BaseSepolia => "base-sepolia",
+            Network::Base => "base",
+            Network::XdcMainnet => "xdc",
+            Network::AvalancheFuji => "avalanche-fuji",
+            Network::Avalanche => "avalanche",
+            Network::XrplEvm => "xrpl-evm",
+            Network::Solana => "solana",
+            Network::SolanaDevnet => "solana-devnet",
+            Network::PolygonAmoy => "polygon-amoy",
+            Network::Polygon => "polygon",
+            Network::Sei => "sei",
+            Network::SeiTestnet => "sei-testnet",
+            Network::BesuPrivate => "besu-private",
+        }
+    }
+
+    fn as_caip2(&self) -> Option<&'static str> {
+        match self {
+            Network::BaseSepolia => Some("eip155:84532"),
+            Network::Base => Some("eip155:8453"),
+            Network::XdcMainnet => Some("eip155:50"),
+            Network::AvalancheFuji => Some("eip155:43113"),
+            Network::Avalanche => Some("eip155:43114"),
+            Network::XrplEvm => Some("eip155:1440000"),
+            Network::PolygonAmoy => Some("eip155:80002"),
+            Network::Polygon => Some("eip155:137"),
+            Network::Sei => Some("eip155:1329"),
+            Network::SeiTestnet => Some("eip155:1328"),
+            // No clear CAIP-2 ids for Solana in this codebase; fall back to legacy.
+            Network::Solana | Network::SolanaDevnet => None,
+            Network::BesuPrivate => Some("eip155:1337"),
+        }
+    }
+
+    fn legacy_variants() -> Vec<&'static str> {
+        Network::variants().iter().map(|n| n.as_legacy()).collect()
+    }
+
+    fn caip2_variants() -> Vec<&'static str> {
+        Network::variants()
+            .iter()
+            .filter_map(|n| n.as_caip2())
+            .collect()
+    }
+
+    fn from_str_any(s: &str) -> Option<Self> {
+        // Try CAIP-2 first, then legacy.
+        let matched = match s {
+            "eip155:84532" => Some(Network::BaseSepolia),
+            "eip155:8453" => Some(Network::Base),
+            "eip155:50" => Some(Network::XdcMainnet),
+            "eip155:43113" => Some(Network::AvalancheFuji),
+            "eip155:43114" => Some(Network::Avalanche),
+            "eip155:1440000" => Some(Network::XrplEvm),
+            "eip155:80002" => Some(Network::PolygonAmoy),
+            "eip155:137" => Some(Network::Polygon),
+            "eip155:1329" => Some(Network::Sei),
+            "eip155:1328" => Some(Network::SeiTestnet),
+            "eip155:1337" => Some(Network::BesuPrivate),
+            "solana:mainnet" => Some(Network::Solana),
+            "solana:devnet" => Some(Network::SolanaDevnet),
+            _ => None,
+        };
+        if matched.is_some() {
+            return matched;
+        }
+        match s {
+            "base-sepolia" => Some(Network::BaseSepolia),
+            "base" => Some(Network::Base),
+            "xdc" => Some(Network::XdcMainnet),
+            "avalanche-fuji" => Some(Network::AvalancheFuji),
+            "avalanche" => Some(Network::Avalanche),
+            "xrpl-evm" => Some(Network::XrplEvm),
+            "solana" => Some(Network::Solana),
+            "solana-devnet" => Some(Network::SolanaDevnet),
+            "polygon-amoy" => Some(Network::PolygonAmoy),
+            "polygon" => Some(Network::Polygon),
+            "sei" => Some(Network::Sei),
+            "sei-testnet" => Some(Network::SeiTestnet),
+            "besu-private" => Some(Network::BesuPrivate),
+            _ => None,
+        }
     }
 }
 
@@ -282,6 +374,20 @@ static USDC_SEI_TESTNET: Lazy<USDCDeployment> = Lazy::new(|| {
     })
 });
 
+/// Placeholder USDC deployment for Besu private networks.
+///
+/// Address/metadata should be supplied via `PaymentRequirements.extra` when using this network.
+static USDC_BESU_PRIVATE: Lazy<USDCDeployment> = Lazy::new(|| {
+    USDCDeployment(TokenDeployment {
+        asset: TokenAsset {
+            address: address!("0x0000000000000000000000000000000000000000").into(),
+            network: Network::BesuPrivate,
+        },
+        decimals: 6,
+        eip712: None,
+    })
+});
+
 /// A known USDC deployment as a wrapper around [`TokenDeployment`].
 #[derive(Clone, Debug)]
 pub struct USDCDeployment(pub TokenDeployment);
@@ -343,6 +449,7 @@ impl USDCDeployment {
             Network::Polygon => &USDC_POLYGON,
             Network::Sei => &USDC_SEI,
             Network::SeiTestnet => &USDC_SEI_TESTNET,
+            Network::BesuPrivate => &USDC_BESU_PRIVATE,
         }
     }
 }
