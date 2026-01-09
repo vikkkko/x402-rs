@@ -244,7 +244,7 @@ impl SenderWallet for SolanaSenderWallet {
             .map_err(|e| X402PaymentsError::SigningError(format!("{e:?}")))?;
 
         let payment_payload = PaymentPayload {
-            x402_version: X402Version::V1,
+            x402_version: X402Version::V2,
             scheme: selected.scheme,
             network: selected.network,
             payload: ExactPaymentPayload::Solana(ExactSolanaPayload {

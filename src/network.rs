@@ -45,6 +45,8 @@ pub enum Network {
     SeiTestnet,
     /// Besu private network (chain ID 1337).
     BesuPrivate,
+    /// NeoX testnet (chain ID 12227332).
+    NeoxTestnet,
 }
 
 impl Display for Network {
@@ -101,6 +103,7 @@ impl From<Network> for NetworkFamily {
             Network::Sei => NetworkFamily::Evm,
             Network::SeiTestnet => NetworkFamily::Evm,
             Network::BesuPrivate => NetworkFamily::Evm,
+            Network::NeoxTestnet => NetworkFamily::Evm,
         }
     }
 }
@@ -122,6 +125,7 @@ impl Network {
             Network::Sei,
             Network::SeiTestnet,
             Network::BesuPrivate,
+            Network::NeoxTestnet,
         ]
     }
 
@@ -140,6 +144,7 @@ impl Network {
             Network::Sei => "sei",
             Network::SeiTestnet => "sei-testnet",
             Network::BesuPrivate => "besu-private",
+            Network::NeoxTestnet => "neox-testnet",
         }
     }
 
@@ -158,6 +163,7 @@ impl Network {
             // No clear CAIP-2 ids for Solana in this codebase; fall back to legacy.
             Network::Solana | Network::SolanaDevnet => None,
             Network::BesuPrivate => Some("eip155:1337"),
+            Network::NeoxTestnet => Some("eip155:12227332"),
         }
     }
 
@@ -186,6 +192,7 @@ impl Network {
             "eip155:1329" => Some(Network::Sei),
             "eip155:1328" => Some(Network::SeiTestnet),
             "eip155:1337" => Some(Network::BesuPrivate),
+            "eip155:12227332" => Some(Network::NeoxTestnet),
             "solana:mainnet" => Some(Network::Solana),
             "solana:devnet" => Some(Network::SolanaDevnet),
             _ => None,
@@ -207,6 +214,7 @@ impl Network {
             "sei" => Some(Network::Sei),
             "sei-testnet" => Some(Network::SeiTestnet),
             "besu-private" => Some(Network::BesuPrivate),
+            "neox-testnet" => Some(Network::NeoxTestnet),
             _ => None,
         }
     }
@@ -374,6 +382,20 @@ static USDC_SEI_TESTNET: Lazy<USDCDeployment> = Lazy::new(|| {
     })
 });
 
+static USDC_NEOX_TESTNET: Lazy<USDCDeployment> = Lazy::new(|| {
+    USDCDeployment(TokenDeployment {
+        asset: TokenAsset {
+            address: address!("0x224CBf9e2b81dde6d2a495e596C145712f026495").into(),
+            network: Network::NeoxTestnet,
+        },
+        decimals: 6,
+        eip712: Some(TokenDeploymentEip712 {
+            name: "USD Coin".into(),
+            version: "1".into(),
+        }),
+    })
+});
+
 /// Placeholder USDC deployment for Besu private networks.
 ///
 /// Address/metadata should be supplied via `PaymentRequirements.extra` when using this network.
@@ -450,6 +472,7 @@ impl USDCDeployment {
             Network::Sei => &USDC_SEI,
             Network::SeiTestnet => &USDC_SEI_TESTNET,
             Network::BesuPrivate => &USDC_BESU_PRIVATE,
+            Network::NeoxTestnet => &USDC_NEOX_TESTNET,
         }
     }
 }

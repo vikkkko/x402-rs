@@ -151,6 +151,7 @@ impl TryFrom<Network> for EvmChain {
             Network::Sei => Ok(EvmChain::new(value, 1329)),
             Network::SeiTestnet => Ok(EvmChain::new(value, 1328)),
             Network::BesuPrivate => Ok(EvmChain::new(value, 1337)),
+            Network::NeoxTestnet => Ok(EvmChain::new(value, 12_227_332)),
             Network::Solana | Network::SolanaDevnet => {
                 Err(FacilitatorLocalError::UnsupportedNetwork(None))
             }
@@ -355,12 +356,20 @@ impl MetaEvmProvider for EvmProvider {
         // Besu expects calldata in the `data` field; normalize to `data` and drop `input`.
         txr.normalize_data();
         if !self.eip1559 {
-            let provider = &self.inner;
-            let gas: u128 = provider
-                .get_gas_price()
-                .instrument(tracing::info_span!("get_gas_price"))
-                .await
-                .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
+            // Check for GAS_PRICE environment variable override
+            let gas: u128 = if let Ok(gas_price_str) = std::env::var("GAS_PRICE") {
+                gas_price_str.parse().map_err(|e| {
+                    FacilitatorLocalError::ContractCall(format!("Invalid GAS_PRICE: {e}"))
+                })?
+            } else {
+                // Fall back to automatic gas price estimation
+                let provider = &self.inner;
+                provider
+                    .get_gas_price()
+                    .instrument(tracing::info_span!("get_gas_price"))
+                    .await
+                    .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?
+            };
             txr.set_gas_price(gas);
         }
 
@@ -435,6 +444,7 @@ impl FromEnvByNetworkBuild for EvmProvider {
             Network::Sei => true,
             Network::SeiTestnet => true,
             Network::BesuPrivate => false,
+            Network::NeoxTestnet => false,
         };
         let provider = EvmProvider::try_new(wallet, &rpc_url, is_eip1559, network).await?;
         Ok(Some(provider))
@@ -723,7 +733,7 @@ where
     async fn supported(&self) -> Result<SupportedPaymentKindsResponse, Self::Error> {
         let kinds = vec![SupportedPaymentKind {
             network: self.chain().network().to_string(),
-            x402_version: X402Version::V1,
+            x402_version: X402Version::V2,
             scheme: Scheme::Exact,
             extra: None,
         }];

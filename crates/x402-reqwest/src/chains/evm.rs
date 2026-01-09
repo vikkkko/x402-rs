@@ -145,7 +145,7 @@ impl SenderWallet for EvmSenderWallet {
         #[cfg(feature = "telemetry")]
         tracing::debug!(?signature, "Signature obtained");
         let payment_payload = PaymentPayload {
-            x402_version: x402_rs::types::X402Version::V1,
+            x402_version: x402_rs::types::X402Version::V2,
             scheme: Scheme::Exact,
             network,
             payload: ExactPaymentPayload::Evm(ExactEvmPayload {

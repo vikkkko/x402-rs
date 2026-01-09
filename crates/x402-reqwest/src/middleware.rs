@@ -1,13 +1,13 @@
 //! Middleware for handling HTTP 402 Payment Required responses using the x402 protocol.
 //!
 //! This module provides the `X402Payments` struct which implements `reqwest_middleware::Middleware`,
-//! allowing automatic retries of requests with valid `X-Payment` headers constructed via a signer.
+//! allowing automatic retries of requests with valid `PAYMENT-SIGNATURE` (and legacy `X-Payment`) headers constructed via a signer.
 //!
 //! It includes:
 //! - Selection of preferred payment methods
 //! - Max token enforcement
 //! - EIP-712-based payload construction and signing
-//! - Base64 encoding into a payment header
+//! - Base64 encoding into payment headers
 
 use http::{Extensions, HeaderValue, StatusCode};
 use reqwest::{Request, Response};
@@ -19,10 +19,15 @@ use tracing::instrument;
 use x402_rs::network::{Network, USDCDeployment};
 use x402_rs::types::{
     Base64Bytes, MixedAddressError, MoneyAmount, MoneyAmountParseError, PaymentPayload,
-    PaymentRequiredResponse, PaymentRequirements, TokenAmount, TokenAsset, TokenDeployment,
+    PaymentRequiredHeader, PaymentRequiredResponse, PaymentRequirements, PaymentSignatureHeader,
+    TokenAmount, TokenAsset, TokenDeployment,
 };
 
 use crate::chains::{IntoSenderWallet, SenderWallet};
+
+const HEADER_PAYMENT_REQUIRED: &str = "PAYMENT-REQUIRED";
+const HEADER_PAYMENT_SIGNATURE: &str = "PAYMENT-SIGNATURE";
+const HEADER_X_PAYMENT: &str = "X-Payment";
 
 /// Represents the maximum allowed amount for a specific token asset.
 pub struct MaxTokenAmount {
@@ -109,6 +114,15 @@ pub enum X402PaymentsError {
     /// Typically caused by invalid characters or excessive length.
     #[error("Failed to encode payment payload to HTTP header")]
     HeaderValueEncodeError(#[source] http::header::InvalidHeaderValue),
+    /// Raised when a `PAYMENT-REQUIRED` header cannot be decoded or parsed.
+    #[error("Failed to decode PAYMENT-REQUIRED header: {0}")]
+    PaymentRequiredHeaderDecode(String),
+    /// Raised when a `PAYMENT-REQUIRED` header does not include an amount.
+    #[error("PAYMENT-REQUIRED header missing amount information")]
+    PaymentRequiredHeaderMissingAmount,
+    /// Raised when a `PAYMENT-REQUIRED` header contains an invalid resource URL.
+    #[error("PAYMENT-REQUIRED header contains invalid resource URL")]
+    PaymentRequiredHeaderInvalidResource,
 }
 
 impl From<X402PaymentsError> for rqm::Error {
@@ -265,6 +279,30 @@ impl X402Payments {
         HeaderValue::from_bytes(b64.as_ref()).map_err(X402PaymentsError::HeaderValueEncodeError)
     }
 
+    /// Encodes the `PaymentPayload` into a base64 string suitable for a `PAYMENT-SIGNATURE` header.
+    pub fn encode_payment_signature_header(
+        payload: &PaymentPayload,
+    ) -> Result<HeaderValue, X402PaymentsError> {
+        let signature = PaymentSignatureHeader {
+            payment_payload: payload.clone(),
+            meta: None,
+        };
+        let json = serde_json::to_vec(&signature).map_err(X402PaymentsError::JsonEncodeError)?;
+        let b64 = Base64Bytes::encode(json);
+        HeaderValue::from_bytes(b64.as_ref()).map_err(X402PaymentsError::HeaderValueEncodeError)
+    }
+
+    async fn build_payment_payload(
+        &self,
+        accepts: &[PaymentRequirements],
+    ) -> Result<PaymentPayload, X402PaymentsError> {
+        let selected = self.select_payment_requirements(accepts)?;
+        #[cfg(feature = "telemetry")]
+        tracing::debug!(?selected, "Selected payment requirement");
+        self.assert_max_amount(&selected)?;
+        self.make_payment_payload(selected).await
+    }
+
     /// Builds the payment header by selecting a requirement, enforcing max,
     /// constructing and signing the payload, and base64-encoding it.
     #[instrument(name = "x402.build_payment_header", skip(self))]
@@ -272,12 +310,79 @@ impl X402Payments {
         &self,
         accepts: &[PaymentRequirements],
     ) -> Result<HeaderValue, X402PaymentsError> {
-        let selected = self.select_payment_requirements(accepts)?;
-        #[cfg(feature = "telemetry")]
-        tracing::debug!(?selected, "Selected payment requirement");
-        self.assert_max_amount(&selected)?;
-        let payment_payload = self.make_payment_payload(selected).await?;
+        let payment_payload = self.build_payment_payload(accepts).await?;
         Self::encode_payment_header(&payment_payload)
+    }
+
+    /// Builds both v2 `PAYMENT-SIGNATURE` and v1 `X-Payment` headers in one pass.
+    pub async fn build_payment_headers(
+        &self,
+        accepts: &[PaymentRequirements],
+    ) -> Result<(HeaderValue, HeaderValue), X402PaymentsError> {
+        let payment_payload = self.build_payment_payload(accepts).await?;
+        let signature = Self::encode_payment_signature_header(&payment_payload)?;
+        let legacy = Self::encode_payment_header(&payment_payload)?;
+        Ok((signature, legacy))
+    }
+
+    fn parse_payment_required_header(
+        header_value: &HeaderValue,
+    ) -> Result<PaymentRequiredHeader, X402PaymentsError> {
+        let raw = header_value.as_bytes();
+        if let Ok(header) = serde_json::from_slice::<PaymentRequiredHeader>(raw) {
+            return Ok(header);
+        }
+        let base64 = Base64Bytes::from(raw);
+        PaymentRequiredHeader::try_from(base64)
+            .map_err(|err| X402PaymentsError::PaymentRequiredHeaderDecode(err.to_string()))
+    }
+
+    fn resolve_resource_url(
+        resource: &str,
+        request_url: &reqwest::Url,
+    ) -> Result<reqwest::Url, X402PaymentsError> {
+        if let Ok(url) = reqwest::Url::parse(resource) {
+            return Ok(url);
+        }
+        request_url
+            .join(resource)
+            .map_err(|_| X402PaymentsError::PaymentRequiredHeaderInvalidResource)
+    }
+
+    fn requirements_from_header(
+        header: &PaymentRequiredHeader,
+        request_url: &reqwest::Url,
+    ) -> Result<Vec<PaymentRequirements>, X402PaymentsError> {
+        let (resource_url, mime_type) = match &header.resource_info {
+            Some(info) => (
+                Self::resolve_resource_url(&info.resource, request_url)?,
+                info.mime_type.clone().unwrap_or_else(|| "application/json".to_string()),
+            ),
+            None => (request_url.clone(), "application/json".to_string()),
+        };
+        header
+            .accepts
+            .iter()
+            .map(|route| {
+                let max_amount_required = route
+                    .max_amount_required
+                    .or(route.amount)
+                    .ok_or(X402PaymentsError::PaymentRequiredHeaderMissingAmount)?;
+                Ok(PaymentRequirements {
+                    scheme: route.scheme,
+                    network: route.network,
+                    max_amount_required,
+                    resource: resource_url.clone(),
+                    description: route.description.clone().unwrap_or_default(),
+                    mime_type: mime_type.clone(),
+                    output_schema: None,
+                    pay_to: route.pay_to.clone(),
+                    max_timeout_seconds: route.timeout_seconds.unwrap_or(300),
+                    asset: route.asset.clone(),
+                    extra: route.meta.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -305,18 +410,32 @@ impl rqm::Middleware for X402Payments {
         #[cfg(feature = "telemetry")]
         tracing::debug!("Received 402 Payment Required");
 
-        let payment_required_response = res.json::<PaymentRequiredResponse>().await?;
+        let mut accepts: Option<Vec<PaymentRequirements>> = None;
+        if let Some(header_value) = res.headers().get(HEADER_PAYMENT_REQUIRED) {
+            let parsed = Self::parse_payment_required_header(header_value)
+                .and_then(|header| Self::requirements_from_header(&header, res.url()));
+            if let Ok(requirements) = parsed {
+                accepts = Some(requirements);
+            }
+        }
+        let accepts = match accepts {
+            Some(requirements) => requirements,
+            None => {
+                let payment_required_response = res.json::<PaymentRequiredResponse>().await?;
+                payment_required_response.accepts
+            }
+        };
 
         let retry_req = async {
-            let payment_header = self
-                .build_payment_header(&payment_required_response.accepts)
-                .await?;
+            let (payment_signature, legacy_payment) =
+                self.build_payment_headers(&accepts).await?;
             let mut req = retry_req.ok_or(X402PaymentsError::RequestNotCloneable)?;
             let headers = req.headers_mut();
-            headers.insert("X-Payment", payment_header);
+            headers.insert(HEADER_PAYMENT_SIGNATURE, payment_signature);
+            headers.insert(HEADER_X_PAYMENT, legacy_payment);
             headers.insert(
                 "Access-Control-Expose-Headers",
-                HeaderValue::from_static("X-Payment-Response"),
+                HeaderValue::from_static("PAYMENT-RESPONSE, X-Payment-Response"),
             );
             Ok::<Request, X402PaymentsError>(req)
         }

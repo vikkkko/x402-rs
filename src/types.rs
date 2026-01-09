@@ -29,17 +29,20 @@ use url::Url;
 use crate::network::Network;
 use crate::timestamp::UnixTimestamp;
 
-/// Represents the protocol version. Currently only version 1 is supported.
+/// Represents the protocol version.
 #[derive(Debug, Copy, Clone)]
 pub enum X402Version {
     /// Version `1`.
     V1,
+    /// Version `2`.
+    V2,
 }
 
 impl Serialize for X402Version {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             X402Version::V1 => serializer.serialize_u8(1),
+            X402Version::V2 => serializer.serialize_u8(2),
         }
     }
 }
@@ -48,6 +51,7 @@ impl Display for X402Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             X402Version::V1 => write!(f, "1"),
+            X402Version::V2 => write!(f, "2"),
         }
     }
 }
@@ -69,6 +73,7 @@ impl TryFrom<u8> for X402Version {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(X402Version::V1),
+            2 => Ok(X402Version::V2),
             _ => Err(X402VersionError(value)),
         }
     }
@@ -300,6 +305,91 @@ pub struct PaymentPayload {
     pub scheme: Scheme,
     pub network: Network,
     pub payload: ExactPaymentPayload,
+}
+
+/// v2 header payload for `PAYMENT-REQUIRED` responses.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentRequiredHeader {
+    pub version: X402Version,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_info: Option<PaymentResourceInfo>,
+    pub accepts: Vec<PaymentRoute>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentResourceInfo {
+    pub resource: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
+/// v2 payment route entry included in `PaymentRequiredHeader.accepts`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentRoute {
+    pub scheme: Scheme,
+    pub network: Network,
+    pub asset: MixedAddress,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<TokenAmount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_amount_required: Option<TokenAmount>,
+    pub pay_to: MixedAddress,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+impl PaymentRoute {
+    pub fn from_requirements(req: &PaymentRequirements) -> Self {
+        Self {
+            scheme: req.scheme,
+            network: req.network,
+            asset: req.asset.clone(),
+            amount: None,
+            max_amount_required: Some(req.max_amount_required),
+            pay_to: req.pay_to.clone(),
+            description: Some(req.description.clone()),
+            timeout_seconds: Some(req.max_timeout_seconds),
+            meta: req.extra.clone(),
+        }
+    }
+}
+
+/// v2 header payload for `PAYMENT-SIGNATURE` requests.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentSignatureHeader {
+    pub payment_payload: PaymentPayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+/// v2 header payload for `PAYMENT-RESPONSE` responses.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentResponseHeader {
+    pub verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled: Option<bool>,
+    pub payer: MixedAddress,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<TransactionHash>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facilitator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount_final: Option<TokenAmount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
 }
 
 /// Error returned when decoding a base64-encoded [`PaymentPayload`] fails.
@@ -1100,6 +1190,58 @@ impl AsRef<[u8]> for Base64Bytes<'_> {
 impl<'a> From<&'a [u8]> for Base64Bytes<'a> {
     fn from(slice: &'a [u8]) -> Self {
         Base64Bytes(Cow::Borrowed(slice))
+    }
+}
+
+/// Error returned when decoding a base64-encoded header payload fails.
+#[derive(Debug, thiserror::Error)]
+pub enum HeaderB64DecodingError {
+    /// The input bytes were not valid base64.
+    #[error("base64 decode error: {0}")]
+    Base64Decode(#[from] base64::DecodeError),
+    /// The JSON structure was invalid or did not conform to the expected schema.
+    #[error("json parse error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+impl TryFrom<Base64Bytes<'_>> for PaymentRequiredHeader {
+    type Error = HeaderB64DecodingError;
+
+    fn try_from(value: Base64Bytes) -> Result<Self, Self::Error> {
+        let decoded = value.decode()?;
+        serde_json::from_slice(&decoded).map_err(HeaderB64DecodingError::from)
+    }
+}
+
+impl TryFrom<Base64Bytes<'_>> for PaymentSignatureHeader {
+    type Error = HeaderB64DecodingError;
+
+    fn try_from(value: Base64Bytes) -> Result<Self, Self::Error> {
+        let decoded = value.decode()?;
+        serde_json::from_slice(&decoded).map_err(HeaderB64DecodingError::from)
+    }
+}
+
+/// Error returned when encoding a [`PaymentResponseHeader`] into base64 fails.
+#[derive(Debug)]
+pub struct PaymentResponseB64EncodingError(pub serde_json::Error);
+
+impl Display for PaymentResponseB64EncodingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Failed to encode payment response as base64 string {}",
+            self.0
+        )
+    }
+}
+
+impl TryInto<Base64Bytes<'static>> for PaymentResponseHeader {
+    type Error = PaymentResponseB64EncodingError;
+
+    fn try_into(self) -> Result<Base64Bytes<'static>, Self::Error> {
+        let json = serde_json::to_vec(&self).map_err(PaymentResponseB64EncodingError)?;
+        Ok(Base64Bytes::encode(json))
     }
 }
 

@@ -48,6 +48,7 @@ impl TryFrom<Network> for SolanaChain {
             Network::Sei => Err(FacilitatorLocalError::UnsupportedNetwork(None)),
             Network::SeiTestnet => Err(FacilitatorLocalError::UnsupportedNetwork(None)),
             Network::BesuPrivate => Err(FacilitatorLocalError::UnsupportedNetwork(None)),
+            Network::NeoxTestnet => Err(FacilitatorLocalError::UnsupportedNetwork(None)),
         }
     }
 }
@@ -660,7 +661,7 @@ impl Facilitator for SolanaProvider {
         let kinds = vec![SupportedPaymentKind {
             network: self.network().to_string(),
             scheme: Scheme::Exact,
-            x402_version: X402Version::V1,
+            x402_version: X402Version::V2,
             extra: Some(SupportedPaymentKindExtra {
                 fee_payer: self.signer_address(),
             }),
